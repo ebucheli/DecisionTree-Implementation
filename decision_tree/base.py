@@ -1,6 +1,7 @@
 """Base class for decision trees with a scikit-learn like API."""
 from abc import ABC, abstractmethod
-
+import numpy as np
+from .node import Node
 
 class BaseDecisionTree(ABC):
     """Skeleton shared by every tree variant (classification, regression, ...).
@@ -81,7 +82,23 @@ class BaseDecisionTree(ABC):
         Returns:
             BaseDecisionTree: ``self`` (the fitted estimator).
         """
-        raise NotImplementedError("TODO: implement fit")
+        # prelimenary checks as requested by instructions:
+        if self.root is not None:
+            raise ValueError("This tree has already been fitted.")
+        if self.max_depth is not None and (not isinstance(self.max_depth, int) or self.max_depth <= 0):
+            raise ValueError("max_depth must be None or a positive integer.")
+        if not isinstance(self.min_samples_split, int) or self.min_samples_split < 2:
+            raise ValueError("min_samples_split must be an integer >= 2.")
+        if self.criterion not in self._supported_criteria:
+            raise ValueError(f"criterion must be one of {self._supported_criteria}.")
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y)
+        if X.ndim != 2 or X.shape[0] == 0 or X.shape[1] == 0:
+            raise ValueError("X must be a non-empty 2D array.")
+        if y.ndim != 1 or y.shape[0] == 0 or X.shape[0] != y.shape[0]:
+            raise ValueError("y must be 1D and have the same number of samples as X.")
+        self.root = self._build_tree(X, y, depth=0)
+        return self
 
     def predict(self, X):
         """Predict a target for each row of ``X``.
@@ -98,7 +115,21 @@ class BaseDecisionTree(ABC):
         Returns:
             array, shape (n_samples,): Predicted target for every sample.
         """
-        raise NotImplementedError("TODO: implement predict")
+        if self.root is None:
+            raise ValueError("This tree has not been fitted.")
+        X = np.asarray(X, dtype=float)
+        if X.ndim != 2:
+            raise ValueError("X must be a 2D array.")
+        predictions = []
+        for x in X:
+            node = self.root
+            while not node.is_leaf:
+                if x[node.feature_index] <= node.threshold:
+                    node = node.left
+                else:
+                    node = node.right
+            predictions.append(node.value)
+        return np.array(predictions)
 
     def eval(self, X, y):
         """Score the model on ``(X, y)``.
@@ -114,7 +145,10 @@ class BaseDecisionTree(ABC):
             float: Metric value (accuracy for classification, R^2 for
             regression; higher is better).
         """
-        raise NotImplementedError("TODO: implement eval")
+        if self.root is None:
+            raise ValueError("This tree has not been fitted.")
+        y_pred = self.predict(X)
+        return self._score(y, y_pred)
 
     @abstractmethod
     def _build_tree(self, X, y, depth):
@@ -135,6 +169,20 @@ class BaseDecisionTree(ABC):
         Returns:
             Node: Subtree built from this data.
         """
+        leaf = Node(value=self._leaf_value(y))
+        while (depth != self.max_depth):
+            if (depth > self.min_samples_split):
+                if (self._best_split(X, y) is None):
+                    return leaf
+                else:
+                    feature_index, threshold = self._best_split(X, y)
+                    left_mask = X[:, feature_index] <= threshold
+                    right_mask = ~left_mask
+                    left_child = self._build_tree(X[left_mask], y[left_mask], depth + 1)
+                    right_child = self._build_tree(X[right_mask], y[right_mask], depth + 1)
+                    return Node(feature_index=feature_index, threshold=threshold, children=[left_child, right_child])
+            else:
+                return leaf
 
     @abstractmethod
     def _impurity(self, y):
@@ -150,6 +198,20 @@ class BaseDecisionTree(ABC):
         Returns:
             float: Impurity of ``y`` (0 for a perfectly pure node).
         """
+        self._impurity(y)
+        len_y = len(y)
+        if len_y == 0:
+            return 0.0
+        if self.criterion == "gini":
+            classes, counts = np.unique(y, return_counts=True)
+            probabilities = counts / len_y
+            return 1 - np.sum(probabilities ** 2)
+        elif self.criterion == "entropy":
+            classes, counts = np.unique(y, return_counts=True)
+            probabilities = counts / len_y
+            return -np.sum(probabilities * np.log2(probabilities))
+        else:
+            raise ValueError(f"Unknown criterion: {self.criterion}")
 
     @abstractmethod
     def _best_split(self, X, y):
@@ -170,6 +232,26 @@ class BaseDecisionTree(ABC):
             tuple (int, float) or None: ``(feature_index, threshold)`` of the
             best split, or ``None`` if no split improves impurity.
         """
+        best_gain = 0.0
+        best_split = None
+        parent_impurity = self._impurity(y)
+
+        for feature_index in range(X.shape[1]):
+            thresholds = np.unique(X[:, feature_index])
+            for i in range(len(thresholds) - 1):
+                threshold = (thresholds[i] + thresholds[i + 1]) / 2
+                left_mask = X[:, feature_index] <= threshold
+                right_mask = ~left_mask
+                if np.sum(left_mask) == 0 or np.sum(right_mask) == 0:
+                    continue
+                impurity_left = self._impurity(y[left_mask])
+                impurity_right = self._impurity(y[right_mask])
+                weighted_impurity = (np.sum(left_mask) * impurity_left + np.sum(right_mask) * impurity_right) / len(y)
+                gain = parent_impurity - weighted_impurity
+                if gain > best_gain:
+                    best_gain = gain
+                    best_split = (feature_index, threshold)
+        return best_split if best_gain > 0 else None
 
     @abstractmethod
     def _leaf_value(self, y):
@@ -184,6 +266,12 @@ class BaseDecisionTree(ABC):
         Returns:
             The single predicted value for the leaf.
         """
+        prediction = None
+        if self.criterion in ["gini", "entropy"]:
+            prediction = np.bincount(y).argmax()  # majority class
+        else:
+            prediction = np.mean(y)  # mean for regression
+        return prediction
 
     @abstractmethod
     def _score(self, y_true, y_pred):
@@ -198,3 +286,9 @@ class BaseDecisionTree(ABC):
         Returns:
             float: Score (higher is better).
         """
+        if self.criterion in ["gini", "entropy"]:
+            return np.mean(y_true == y_pred)  # accuracy
+        else:
+            ss_res = np.sum((y_true - y_pred) ** 2)
+            ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+            return 1 - ss_res / ss_tot  # R^2
